@@ -126,8 +126,6 @@ RawStream::RawStream(ros::NodeHandle &nh, const std::string &name,
     : _raw_data_topic(raw_data_topic),
       _rtcm_data_topic(rtcm_data_topic),
       _raw_data_publisher(nh.advertise<std_msgs::String>(_raw_data_topic, 256)),
-      _rtk_data_publisher(
-          nh.advertise<std_msgs::String>(_rtcm_data_topic, 256)),
       _stream_status_publisher(
           nh.advertise<apollo::common::gnss_status::StreamStatus>(
               stream_status_topic, 256, true)) {
@@ -146,10 +144,6 @@ bool RawStream::init(const std::string &cfg_file) {
   }
   _stream_status->mutable_header()->set_timestamp_sec(ros::Time::now().toSec());
   _stream_status->set_ins_stream_type(
-      apollo::common::gnss_status::StreamStatus::DISCONNECTED);
-  _stream_status->set_rtk_stream_in_type(
-      apollo::common::gnss_status::StreamStatus::DISCONNECTED);
-  _stream_status->set_rtk_stream_out_type(
       apollo::common::gnss_status::StreamStatus::DISCONNECTED);
   _stream_status_publisher.publish(_stream_status);
   if (!parse_config_text(cfg_file, &_config)) {
@@ -197,51 +191,6 @@ bool RawStream::init(const std::string &cfg_file) {
     _command_stream_status = _data_stream_status;
   }
 
-  if (_config.has_rtk_from()) {
-    s = create_stream(_config.rtk_from());
-    if (s == nullptr) {
-      ROS_ERROR("Failed to create rtk_from stream.");
-      return false;
-    }
-    _in_rtk_stream.reset(s);
-
-    if (_config.rtk_from().has_push_location()) {
-      _push_location = _config.rtk_from().push_location();
-    }
-
-    status = new Status();
-    if (!status) {
-      ROS_ERROR("Failed to create rtk_from stream status.");
-      return false;
-    }
-    _in_rtk_stream_status.reset(status);
-
-    if (_config.has_rtk_to()) {
-      s = create_stream(_config.rtk_to());
-      if (s == nullptr) {
-        ROS_ERROR("Failed to create rtk_to stream.");
-        return false;
-      }
-      _out_rtk_stream.reset(s);
-
-      status = new Status();
-      if (!status) {
-        ROS_ERROR("Failed to create rtk_to stream status.");
-        return false;
-      }
-      _out_rtk_stream_status.reset(status);
-    } else {
-      _out_rtk_stream = _data_stream;
-      _out_rtk_stream_status = _data_stream_status;
-    }
-
-    if (_config.has_rtk_solution_type()) {
-      if (_config.rtk_solution_type() ==
-          config::Config::RTK_SOFTWARE_SOLUTION) {
-        _rtk_software_solution = true;
-      }
-    }
-  }
 
   if (_config.login_commands_size() == 0) {
     ROS_WARN("No login_commands in config file.");
@@ -263,7 +212,6 @@ bool RawStream::init(const std::string &cfg_file) {
   }
 
   _data_thread_ptr.reset(new std::thread(&RawStream::data_spin, this));
-  _rtk_thread_ptr.reset(new std::thread(&RawStream::rtk_spin, this));
 
   return true;
 }
@@ -291,35 +239,6 @@ bool RawStream::connect() {
     }
   }
 
-  if (_in_rtk_stream) {
-    if (_in_rtk_stream->get_status() != Stream::Status::CONNECTED) {
-      if (!_in_rtk_stream->connect()) {
-        ROS_ERROR("in rtk stream connect failed.");
-      } else {
-        _in_rtk_stream_status->status = Stream::Status::CONNECTED;
-        _stream_status->set_rtk_stream_in_type(
-            apollo::common::gnss_status::StreamStatus::CONNECTED);
-      }
-    }
-  } else {
-    _stream_status->set_rtk_stream_in_type(
-        apollo::common::gnss_status::StreamStatus::CONNECTED);
-  }
-
-  if (_out_rtk_stream) {
-    if (_out_rtk_stream->get_status() != Stream::Status::CONNECTED) {
-      if (!_out_rtk_stream->connect()) {
-        ROS_ERROR("out rtk stream connect failed.");
-      } else {
-        _out_rtk_stream_status->status = Stream::Status::CONNECTED;
-        _stream_status->set_rtk_stream_out_type(
-            apollo::common::gnss_status::StreamStatus::CONNECTED);
-      }
-    }
-  } else {
-    _stream_status->set_rtk_stream_out_type(
-        apollo::common::gnss_status::StreamStatus::CONNECTED);
-  }
   return true;
 }
 
@@ -337,22 +256,6 @@ bool RawStream::disconnect() {
     if (_command_stream->get_status() == Stream::Status::CONNECTED) {
       if (!_data_stream->disconnect()) {
         ROS_ERROR("command stream disconnect failed.");
-        return false;
-      }
-    }
-  }
-  if (_in_rtk_stream) {
-    if (_in_rtk_stream->get_status() == Stream::Status::CONNECTED) {
-      if (!_in_rtk_stream->disconnect()) {
-        ROS_ERROR("in rtk stream disconnect failed.");
-        return false;
-      }
-    }
-  }
-  if (_out_rtk_stream) {
-    if (_out_rtk_stream->get_status() == Stream::Status::CONNECTED) {
-      if (!_out_rtk_stream->disconnect()) {
-        ROS_ERROR("out rtk stream disconnect failed.");
         return false;
       }
     }
@@ -394,21 +297,6 @@ void RawStream::stream_status_check() {
     _stream_status->set_ins_stream_type(report_stream_status);
   }
 
-  if (_in_rtk_stream &&
-      (_in_rtk_stream->get_status() != _in_rtk_stream_status->status)) {
-    _in_rtk_stream_status->status = _in_rtk_stream->get_status();
-    status_report = true;
-    switch_stream_status(_in_rtk_stream_status->status, report_stream_status);
-    _stream_status->set_rtk_stream_in_type(report_stream_status);
-  }
-
-  if (_out_rtk_stream &&
-      (_out_rtk_stream->get_status() != _out_rtk_stream_status->status)) {
-    _out_rtk_stream_status->status = _out_rtk_stream->get_status();
-    status_report = true;
-    switch_stream_status(_out_rtk_stream_status->status, report_stream_status);
-    _stream_status->set_rtk_stream_out_type(report_stream_status);
-  }
 
   if (status_report) {
     _stream_status->mutable_header()->set_timestamp_sec(
@@ -431,67 +319,12 @@ void RawStream::data_spin() {
       msg_pub->data.assign(reinterpret_cast<const char *>(_buffer), length);
       _raw_data_publisher.publish(msg_pub);
 
-      if (_push_location) {
-        push_gpgga(length);
-      }
     }
     stream_status_check();
   }
 }
 
-void RawStream::rtk_spin() {
-  if (_in_rtk_stream == nullptr) {
-    return;
-  }
-  while (ros::ok()) {
-    size_t length = _in_rtk_stream->read(_buffer_rtk, BUFFER_SIZE);
-    if (length > 0) {
-      if (_rtk_software_solution) {
-        publish_rtk_data(length);
-      } else {
-        publish_rtk_data(length);
-        if (_out_rtk_stream == nullptr) {
-          continue;
-        }
-        size_t ret = _out_rtk_stream->write(_buffer_rtk, length);
-        if (ret != length) {
-          ROS_ERROR_STREAM("Expect write out rtk stream bytes "
-                           << length << " but got " << ret);
-        }
-      }
-    }
-  }
-}
 
-void RawStream::publish_rtk_data(size_t length) {
-  std_msgs::StringPtr rtkmsg_pub(new std_msgs::String);
-  if (!rtkmsg_pub) {
-    ROS_ERROR("New rtkmsg failed.");
-    return;
-  }
-
-  rtkmsg_pub->data.assign(reinterpret_cast<const char *>(_buffer_rtk), length);
-  _rtk_data_publisher.publish(rtkmsg_pub);
-}
-
-void RawStream::push_gpgga(size_t length) {
-  if (!_in_rtk_stream) {
-    return;
-  }
-
-  char *gpgga = strstr(reinterpret_cast<char *>(_buffer), "$GPGGA");
-  if (gpgga) {
-    char *p = strchr(gpgga, '*');
-    if (p) {
-      p += 5;
-      if ((p - reinterpret_cast<char *>(_buffer)) <= length) {
-        ROS_INFO_THROTTLE(5, "Push gpgga.");
-        _in_rtk_stream->write(reinterpret_cast<uint8_t *>(gpgga),
-                              reinterpret_cast<uint8_t *>(p) - _buffer);
-      }
-    }
-  }
-}
 
 }  // namespace gnss
 }  // namespace drivers
